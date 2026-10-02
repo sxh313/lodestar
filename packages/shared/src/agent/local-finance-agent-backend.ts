@@ -1,0 +1,425 @@
+import type {
+  AgentBackend,
+  AgentRequest,
+  AgentResponse,
+  AgentSessionSnapshot,
+  ApiResult,
+  AnswerBlock,
+  Kline,
+  PortfolioSnapshot,
+  Quote,
+  ToolCallRecord,
+  ToolDefinition,
+} from '@finagent/core';
+import { FinanceToolRegistry, type FinanceToolName } from './finance-tool-registry.ts';
+import { routeFinanceIntent, unsupportedFinanceMessage, type FinanceIntent } from './intent-router.ts';
+import { MarketDataService } from './market-data-service.ts';
+import { createPhaseOneRegistry } from '../capabilities/index.ts';
+import { composeToolResponse } from './response-composer.ts';
+import {
+  appendBlocksToAnswer,
+  buildPortfolioTableBlock,
+  buildQuoteAnswerBlocks,
+  buildRiskComparisonBlock,
+  dailyVolatility,
+} from './answer-block-emitter.ts';
+import { toApiError } from './errors.ts';
+
+export interface LocalFinanceAgentBackendOptions {
+  registry?: FinanceToolRegistry;
+  marketData?: MarketDataService;
+  /** Label emitted answer blocks as built-in sample data (offline demo mode). */
+  demoData?: boolean;
+  now?: () => number;
+}
+
+export class LocalFinanceAgentBackend implements AgentBackend {
+  private readonly registry: FinanceToolRegistry;
+  private readonly now: () => number;
+  private readonly demoData: boolean;
+  private readonly sessions = new Map<string, AgentSessionSnapshot>();
+
+  constructor(options: LocalFinanceAgentBackendOptions = {}) {
+    this.now = options.now ?? Date.now;
+    this.demoData = options.demoData === true;
+    const marketData = options.marketData ?? new MarketDataService();
+    this.registry = options.registry ?? new FinanceToolRegistry(
+      createPhaseOneRegistry(marketData),
+      { now: this.now }
+    );
+  }
+
+  async getTools(): Promise<ApiResult<ToolDefinition[]>> {
+    return { ok: true, data: this.registry.getTools() };
+  }
+
+  async send(request: AgentRequest): Promise<ApiResult<AgentResponse>> {
+    const session = this.getSession(request.sessionId);
+    const workspaceSymbol =
+      typeof request.context?.activeSymbol === 'string' && request.context.activeSymbol.length > 0
+        ? request.context.activeSymbol.toUpperCase()
+        : undefined;
+    const routingSession = workspaceSymbol
+      ? { ...session, recentSymbols: [workspaceSymbol, ...session.recentSymbols] }
+      : session;
+    const routed = routeFinanceIntent(request.content, routingSession);
+    if (routed.intent === 'unsupported') {
+      session.lastIntent = routed.intent;
+      const content = unsupportedFinanceMessage();
+      return {
+        ok: true,
+        data: {
+          answer: content,
+          content,
+          session,
+          sessionSnapshot: session,
+          toolCalls: [],
+        },
+      };
+    }
+
+    if (routed.intent === 'portfolio_risk') {
+      return { ok: true, data: await this.answerPortfolioRisk(session) };
+    }
+
+    const toolName = intentToToolName(routed.intent);
+    const args = routed.symbol ? { symbol: routed.symbol } : {};
+    const toolCall = this.createToolCall(toolName, args);
+    session.toolCalls.unshift(toolCall);
+    session.lastIntent = routed.intent;
+
+    try {
+      const result = await this.registry.execute({ name: toolName, args });
+      toolCall.status = 'success';
+      toolCall.completedAt = this.now();
+      if (routed.symbol) {
+        rememberSymbol(session, routed.symbol);
+      }
+      toolCall.result = structuredResult(result.details, result.provenance, result.evidence);
+      const response = composeToolResponse(toolName, result, toolCall, session);
+      const enriched = await this.enrichWithAnswerBlocks(
+        response,
+        routed.intent,
+        result.details,
+        toolCall,
+        session,
+        routed.symbol
+      );
+      enriched.session = session;
+      return { ok: true, data: enriched };
+    } catch (error) {
+      const apiError = toApiError(error);
+      toolCall.status = 'error';
+      toolCall.completedAt = this.now();
+      toolCall.error = apiError;
+      session.lastError = apiError;
+      return {
+        ok: true,
+        data: {
+          answer: apiError.message,
+          content: apiError.message,
+          tool: toolName,
+          toolName,
+          toolCalls: [toolCall],
+          session,
+          sessionSnapshot: session,
+        },
+      };
+    }
+  }
+
+  getSessionSnapshot(sessionId = 'default') {
+    return this.getSession(sessionId);
+  }
+
+  /** Restore persisted session context (e.g. recent symbols) after a restart. */
+  restoreSession(sessionId: string, recentSymbols: string[]): void {
+    const session = this.getSession(sessionId);
+    if (recentSymbols.length > 0) {
+      session.recentSymbols = recentSymbols.slice(0, 5);
+    }
+  }
+
+  private getSession(sessionId: string): AgentSessionSnapshot {
+    const existing = this.sessions.get(sessionId);
+    if (existing) {
+      return existing;
+    }
+
+    const session: AgentSessionSnapshot = {
+      id: sessionId,
+      recentSymbols: [],
+      toolCalls: [],
+    };
+    this.sessions.set(sessionId, session);
+    return session;
+  }
+
+  private async answerPortfolioRisk(session: AgentSessionSnapshot): Promise<AgentResponse> {
+    const toolCalls: ToolCallRecord[] = [];
+    session.lastIntent = 'portfolio_risk';
+
+    const executeStep = async (toolName: FinanceToolName, args: Record<string, unknown>) => {
+      const toolCall = this.createToolCall(toolName, args);
+      toolCalls.push(toolCall);
+      session.toolCalls.unshift(toolCall);
+      try {
+        const result = await this.registry.execute({ name: toolName, args });
+        toolCall.status = 'success';
+        toolCall.completedAt = this.now();
+        toolCall.result = structuredResult(result.details, result.provenance, result.evidence);
+        return result.details;
+      } catch (error) {
+        const apiError = toApiError(error);
+        toolCall.status = 'error';
+        toolCall.completedAt = this.now();
+        toolCall.error = apiError;
+        session.lastError = apiError;
+        return undefined;
+      }
+    };
+
+    const portfolio = await executeStep('get_portfolio', {}) as PortfolioSnapshot | undefined;
+    const positions = portfolio?.holdings ?? [];
+    const symbols = positions.map((position) => position.symbol).slice(0, 5);
+    const quotes = new Map<string, Quote>();
+    const klines = new Map<string, Kline[]>();
+
+    for (const symbol of symbols) {
+      const quote = await executeStep('get_quote', { symbol }) as Quote | undefined;
+      if (quote) {
+        quotes.set(symbol, quote);
+        rememberSymbol(session, symbol);
+      }
+      const kline = await executeStep('get_kline', { symbol, period: '1d', limit: 30 }) as Kline[] | undefined;
+      if (kline) klines.set(symbol, kline);
+    }
+
+    const content = composePortfolioRiskAnswer(
+      portfolio,
+      quotes,
+      klines,
+      toolCalls,
+      this.demoData ? 'demo' : undefined
+    );
+    return {
+      answer: content,
+      content,
+      toolName: 'get_portfolio',
+      tool: 'portfolio_risk',
+      toolCalls,
+      session,
+      sessionSnapshot: session,
+      trace: toolCalls.map((toolCall) => ({
+        id: `${toolCall.id}:trace`,
+        type: 'tool_call',
+        timestamp: toolCall.completedAt ?? toolCall.startedAt,
+        message: `${toolCall.toolName} ${toolCall.status}`,
+        data: {
+          args: toolCall.args,
+          error: toolCall.error,
+        },
+      })),
+    };
+  }
+
+  private createToolCall(toolName: FinanceToolName, args: Record<string, unknown>): ToolCallRecord {
+    return {
+      id: `${toolName}-${this.now()}`,
+      toolName,
+      args,
+      startedAt: this.now(),
+      status: 'success',
+    };
+  }
+
+  /**
+   * #31: append typed answer blocks to the local provider's deterministic
+   * answers. Quote answers additionally fetch a 30-day K-line series for the
+   * time-series chart; a failed chart call degrades the quote answer, never
+   * breaks it.
+   */
+  private async enrichWithAnswerBlocks(
+    response: AgentResponse,
+    intent: FinanceIntent,
+    details: unknown,
+    toolCall: ToolCallRecord,
+    session: AgentSessionSnapshot,
+    symbol?: string
+  ): Promise<AgentResponse> {
+    const blocks: AnswerBlock[] = [];
+
+    if (intent === 'quote' && isQuoteDetails(details)) {
+      const chartSymbol = symbol ?? details.symbol;
+      const source = this.demoData ? 'demo' : undefined;
+      const klineCall = this.createToolCall('get_kline', { symbol: chartSymbol, period: '1d', limit: 30 });
+      let klines: Kline[] | undefined;
+      try {
+        const klineResult = await this.registry.execute({
+          name: 'get_kline',
+          args: { symbol: chartSymbol, period: '1d', limit: 30 },
+        });
+        klineCall.result = structuredResult(klineResult.details, klineResult.provenance);
+        klines = isKlineList(klineResult.details) ? klineResult.details : undefined;
+        blocks.push(...buildQuoteAnswerBlocks(details, klines, [toolCall.id, klineCall.id], source));
+      } catch (error) {
+        klineCall.status = 'error';
+        klineCall.error = toApiError(error);
+        blocks.push(...buildQuoteAnswerBlocks(details, undefined, [toolCall.id], source));
+      }
+      klineCall.completedAt = this.now();
+      session.toolCalls.unshift(klineCall);
+      response.toolCalls = [toolCall, klineCall];
+    } else if (intent === 'portfolio' && isPortfolioDetails(details)) {
+      const table = buildPortfolioTableBlock(details, [toolCall.id], this.demoData ? 'demo' : undefined);
+      if (table) blocks.push(table);
+    }
+
+    if (blocks.length > 0) {
+      const enriched = appendBlocksToAnswer(response.answer, blocks);
+      response.answer = enriched;
+      response.content = enriched;
+    }
+    return response;
+  }
+}
+
+function intentToToolName(intent: 'quote' | 'kline' | 'portfolio' | 'intraday'): FinanceToolName {
+  if (intent === 'portfolio') return 'get_portfolio';
+  if (intent === 'kline') return 'get_kline';
+  if (intent === 'intraday') return 'get_intraday';
+  return 'get_quote';
+}
+
+function composePortfolioRiskAnswer(
+  portfolio: PortfolioSnapshot | undefined,
+  quotes: Map<string, Quote>,
+  klines: Map<string, Kline[]>,
+  toolCalls: ToolCallRecord[],
+  source?: string
+) {
+  if (!portfolio) {
+    return '无法完成组合风险分析：持仓数据不可用。请检查 LongBridge 连接后重试。';
+  }
+
+  const totalValue = portfolio.totalAssets ?? 0;
+  const cash = portfolio.cash ?? 0;
+  const investedValue = Math.max(totalValue - cash, 0);
+  const cashRatio = totalValue > 0 ? cash / totalValue : 0;
+  const sortedPositions = [...portfolio.holdings].sort(
+    (a, b) => (b.marketValueBase ?? b.marketValue ?? 0) - (a.marketValueBase ?? a.marketValue ?? 0)
+  );
+  const topPosition = sortedPositions[0];
+  const topPositionValue = topPosition ? (topPosition.marketValueBase ?? topPosition.marketValue ?? 0) : 0;
+  const topWeight = topPosition && totalValue > 0 ? topPositionValue / totalValue : 0;
+  const failedCalls = toolCalls.filter((toolCall) => toolCall.status === 'error');
+  const volatilityLines = sortedPositions.slice(0, 5).map((position) => {
+    const series = klines.get(position.symbol) ?? [];
+    const volatility = estimateVolatility(series);
+    const quote = quotes.get(position.symbol);
+    const dayMove = quote ? `${quote.changePercent.toFixed(2)}%` : 'n/a';
+    const positionValue = position.marketValueBase ?? position.marketValue ?? 0;
+    const weight = totalValue > 0 ? positionValue / totalValue : 0;
+    return `- ${position.symbol}: weight ${formatPercent(weight)}, 30d vol ${volatility}, day ${dayMove}`;
+  });
+
+  const concentrationRisk = topWeight >= 0.35 ? '高' : topWeight >= 0.2 ? '中' : '低';
+  const marketRisk = averageVolatility(klines) >= 0.03 ? '高' : averageVolatility(klines) >= 0.018 ? '中' : '低';
+
+  const text = [
+    'Portfolio Risk Summary',
+    '----------------------',
+    `Total value: $${totalValue.toFixed(2)} | Invested: $${investedValue.toFixed(2)} | Cash: ${formatPercent(cashRatio)}`,
+    `Concentration risk: ${concentrationRisk}${topPosition ? ` (${topPosition.symbol} ${formatPercent(topWeight)})` : ''}`,
+    `Market volatility risk: ${marketRisk}`,
+    '',
+    'Position signals',
+    ...(volatilityLines.length > 0 ? volatilityLines : ['- No positions to analyze.']),
+    '',
+    'Notes',
+    '- This is a deterministic risk screen based on holdings, quotes, and recent K-line volatility.',
+    failedCalls.length > 0
+      ? `- Data gaps: ${failedCalls.map((toolCall) => `${toolCall.toolName} failed`).join(', ')}.`
+      : '- Data gaps: none from executed tools.',
+  ].join('\n');
+
+  // #31: a position-by-position comparison block over the same data.
+  const evidenceIds = toolCalls
+    .filter((toolCall) => toolCall.status === 'success')
+    .map((toolCall) => toolCall.id)
+    .slice(0, 4);
+  const comparison = buildRiskComparisonBlock(
+    sortedPositions.slice(0, 5).map((position) => {
+      const positionValue = position.marketValueBase ?? position.marketValue ?? 0;
+      const quote = quotes.get(position.symbol);
+      return {
+        symbol: position.symbol,
+        weight: totalValue > 0 ? positionValue / totalValue : null,
+        volatility: dailyVolatility(klines.get(position.symbol)),
+        dayChangePercent: quote ? quote.changePercent : null,
+      };
+    }),
+    evidenceIds,
+    source
+  );
+  return comparison ? appendBlocksToAnswer(text, [comparison]) : text;
+}
+
+function estimateVolatility(klines: Kline[]) {
+  const value = calculateVolatility(klines);
+  return value === 0 ? 'n/a' : formatPercent(value);
+}
+
+function averageVolatility(klines: Map<string, Kline[]>) {
+  const values = [...klines.values()].map(calculateVolatility).filter((value) => value > 0);
+  if (values.length === 0) return 0;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function calculateVolatility(klines: Kline[]) {
+  const closes = klines.map((kline) => kline.close).filter((value) => Number.isFinite(value) && value > 0);
+  if (closes.length < 3) return 0;
+  const returns = closes.slice(1).map((close, index) => close / closes[index] - 1);
+  const average = returns.reduce((sum, value) => sum + value, 0) / returns.length;
+  const variance = returns.reduce((sum, value) => sum + (value - average) ** 2, 0) / returns.length;
+  return Math.sqrt(variance);
+}
+
+function formatPercent(value: number) {
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+function rememberSymbol(session: AgentSessionSnapshot, symbol: string) {
+  session.recentSymbols = [
+    symbol,
+    ...session.recentSymbols.filter((existing) => existing !== symbol),
+  ].slice(0, 5);
+}
+
+function structuredResult(
+  details: unknown,
+  provenance?: { provider: string; fetchedAt: number },
+  evidence?: unknown
+) {
+  if (!provenance) return details;
+  return { data: details, provenance, ...(evidence ? { evidence } : {}) };
+}
+
+function isQuoteDetails(value: unknown): value is Quote {
+  return Boolean(value)
+    && typeof value === 'object'
+    && typeof (value as Quote).lastPrice === 'number'
+    && typeof (value as Quote).symbol === 'string';
+}
+
+function isPortfolioDetails(value: unknown): value is PortfolioSnapshot {
+  return Boolean(value)
+    && typeof value === 'object'
+    && Array.isArray((value as PortfolioSnapshot).holdings);
+}
+
+function isKlineList(value: unknown): value is Kline[] {
+  return Array.isArray(value)
+    && value.length > 0
+    && value.every((kline) => typeof kline === 'object' && kline !== null && typeof (kline as Kline).close === 'number');
+}

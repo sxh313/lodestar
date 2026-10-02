@@ -1,0 +1,41 @@
+node_modules
+
+# Build outputs
+dist
+apps/*/dist
+packages/*/dist
+apps/electron/build
+apps/electron/src/main/index.js
+
+# Local environment
+.env
+.env.*
+
+# Longbridge account fixtures — captured from a real authenticated account;
+# never commit balances/positions. Regenerate with
+# packages/longbridge-tools/src/testing/capture.sh.
+packages/longbridge-tools/src/testing/fixtures/positions.json
+packages/longbridge-tools/src/testing/fixtures/positions.cmd.txt
+packages/longbridge-tools/src/testing/fixtures/assets.json
+packages/longbridge-tools/src/testing/fixtures/assets.cmd.txt
+packages/longbridge-tools/src/testing/fixtures/cash-flow.json
+packages/longbridge-tools/src/testing/fixtures/cash-flow.cmd.txt
+packages/longbridge-tools/src/testing/fixtures/portfolio.json
+packages/longbridge-tools/src/testing/fixtures/portfolio.cmd.txt
+
+# Claude local session artifacts
+.claude/logs
+**/.claude/logs
+.claude/session-context-*.md
+
+# OS/editor noise
+.DS_Store
+
+# E2E artifacts
+apps/electron/e2e/.user-data
+apps/electron/e2e/.user-data-interactions
+apps/electron/e2e/.user-data*
+apps/electron/e2e/artifacts/
+
+# Local eval / Langfuse smoke output
+artifacts/

@@ -1,0 +1,41 @@
+{
+  "name": "finagent",
+  "version": "0.4.0-beta.2",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "bun run vite:dev",
+    "vite:dev": "cd apps/electron && bunx vite",
+    "build": "bun run build:packages && bun run build:electron",
+    "build:packages": "bun run --filter './packages/*' build",
+    "build:electron": "cd apps/electron && bun run build",
+    "typecheck": "bun run --filter './**' typecheck",
+    "lint": "bun run --filter './**' lint",
+    "test:unit": "bun test --isolate",
+    "test:integration": "bun test --isolate && bun run typecheck",
+    "eval:smoke": "bun scripts/eval/run.ts --smoke",
+    "eval:full": "bun scripts/eval/run.ts",
+    "eval:langfuse": "bun scripts/eval/langfuse-live.ts",
+    "test:ui": "bun test packages/ui",
+    "test:e2e": "cd apps/electron && bun run test:e2e",
+    "test:e2e:visible": "cd apps/electron && FINAGENT_E2E_VISIBLE=1 bun run test:e2e",
+    "test:package-smoke": "cd apps/electron && bun run test:package-smoke",
+    "test:release": "bun run release:check",
+    "release:check": "bun run scripts/release-check.mjs",
+    "release:package": "bun run scripts/release-package.mjs",
+    "i18n:check": "bun scripts/i18n-check.ts",
+    "trace:showcase": "cd apps/electron && node e2e/trace-showcase.mjs"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "file:.pi/extensions/langsmith/vendor/pi-coding-agent",
+    "bun-types": "^1.0.0",
+    "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "@langchain/langsmith-pi-extension": "^0.2.0",
+    "vite": "^8.0.10"
+  }
+}

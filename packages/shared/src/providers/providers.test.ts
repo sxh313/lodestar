@@ -1,0 +1,764 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { getEventListeners } from 'node:events';
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
+import type {
+  AccountAssets,
+  BrokerAccount,
+  BrokerAccountProvider,
+  CapabilityId,
+  CashFlowRecord,
+  FinancialDataProvider,
+  Holding,
+  PortfolioSnapshot,
+  ProviderHealth,
+  ProviderResult,
+} from '@finagent/core';
+import { JsonFileStore } from '../storage/json-file-store.ts';
+import { ConnectionStore } from './connection.ts';
+import { BROKER_CAPABILITY_IDS, capabilityMapping } from './coverage.ts';
+import { healthAll } from './health.ts';
+import { ProviderRegistry } from './registry.ts';
+import { ProviderFetchError, createRouterFetchers } from './router-fetchers.ts';
+import { ProviderRouter } from './router.ts';
+
+type Handler = (
+  capabilityId: CapabilityId,
+  input: unknown,
+  signal?: AbortSignal
+) => Promise<ProviderResult<unknown>>;
+
+function success<T>(providerId: string, providerName: string, data: T): ProviderResult<T> {
+  return {
+    ok: true,
+    data,
+    provenance: { providerId, providerName, fetchedAt: 1000, stale: false },
+  };
+}
+
+function failure(code: string, message = 'provider failure'): ProviderResult<never> {
+  return { ok: false, error: { code, message } };
+}
+
+class FakeFinancialDataProvider implements FinancialDataProvider {
+  kind = 'financial-data' as const;
+
+  constructor(
+    readonly id: string,
+    readonly name: string,
+    private readonly caps: CapabilityId[],
+    private readonly handler: Handler = async () => success(this.id, this.name, undefined)
+  ) {}
+
+  async status(): Promise<ProviderHealth> {
+    return { status: 'connected', lastCheck: 1234 };
+  }
+
+  capabilities(): CapabilityId[] {
+    return [...this.caps];
+  }
+
+  markets() {
+    return [{ id: 'US', name: 'United States' }];
+  }
+
+  async execute<T>(
+    capabilityId: CapabilityId,
+    input: unknown,
+    signal?: AbortSignal
+  ): Promise<ProviderResult<T>> {
+    const result = await this.handler(capabilityId, input, signal);
+    const typed = result as ProviderResult<T>;
+    return typed;
+  }
+}
+
+class FakeBrokerAccountProvider implements BrokerAccountProvider {
+  kind = 'broker-account' as const;
+
+  constructor(readonly id: string, readonly name: string) {}
+
+  async status(): Promise<ProviderHealth> {
+    return { status: 'connected', lastCheck: 1234 };
+  }
+
+  async accounts(): Promise<ProviderResult<BrokerAccount[]>> {
+    return success(this.id, this.name, [{ id: 'acct', name: 'Default' }]);
+  }
+
+  async getPortfolio(
+    accountId?: string,
+    signal?: AbortSignal
+  ): Promise<ProviderResult<PortfolioSnapshot>> {
+    const snapshot: PortfolioSnapshot = { accounts: [], holdings: [], fetchedAt: 1000 };
+    return success(this.id, this.name, snapshot);
+  }
+
+  async getPositions(
+    accountId?: string,
+    signal?: AbortSignal
+  ): Promise<ProviderResult<Holding[]>> {
+    return success(this.id, this.name, []);
+  }
+
+  async getAssets(
+    accountId?: string,
+    signal?: AbortSignal
+  ): Promise<ProviderResult<AccountAssets[]>> {
+    return success(this.id, this.name, []);
+  }
+
+  async getCashFlow(
+    accountId?: string,
+    options?: unknown,
+    signal?: AbortSignal
+  ): Promise<ProviderResult<CashFlowRecord[]>> {
+    return success(this.id, this.name, []);
+  }
+}
+
+describe('ProviderRegistry', () => {
+  it('registers and lists providers by id', () => {
+    const registry = new ProviderRegistry();
+    const primary = new FakeFinancialDataProvider('p', 'Primary', ['market.quote']);
+    registry.register(primary);
+    expect(registry.get('p')).toBe(primary);
+    expect(registry.list()).toEqual([primary]);
+  });
+
+  it('throws on duplicate id', () => {
+    const registry = new ProviderRegistry();
+    registry.register(new FakeFinancialDataProvider('p', 'Primary', ['market.quote']));
+    expect(() =>
+      registry.register(new FakeFinancialDataProvider('p', 'Other', ['market.depth']))
+    ).toThrow(/already registered/);
+  });
+});
+
+describe('ProviderRouter.execute', () => {
+  it('uses persisted routing and skips disabled providers at execution time', async () => {
+    let primary = 'fallback';
+    const disabled = new Set<string>();
+    const router = new ProviderRouter({
+      resolveRouting: async () => ({ primary, fallback: 'primary' }),
+      isEnabled: async (providerId) => !disabled.has(providerId),
+    });
+    router.register(
+      new FakeFinancialDataProvider('primary', 'Primary', ['market.quote'], async () =>
+        success('primary', 'Primary', 'primary')
+      )
+    );
+    router.register(
+      new FakeFinancialDataProvider('fallback', 'Fallback', ['market.quote'], async () =>
+        success('fallback', 'Fallback', 'fallback')
+      )
+    );
+
+    const first = await router.execute<string>('market.quote', {});
+    expect(first.ok && first.provenance.providerId).toBe('fallback');
+
+    primary = 'primary';
+    disabled.add('primary');
+    const second = await router.execute<string>('market.quote', {});
+    expect(second.ok && second.provenance.providerId).toBe('fallback');
+  });
+
+  it('collects every supporting provider for reconciliation', async () => {
+    const router = new ProviderRouter();
+    router.register(
+      new FakeFinancialDataProvider('primary', 'Primary', ['company.financials'], async () =>
+        success('primary', 'Primary', { value: 100 })
+      )
+    );
+    router.register(
+      new FakeFinancialDataProvider('fallback', 'Fallback', ['company.financials'], async () =>
+        success('fallback', 'Fallback', { value: 130 })
+      )
+    );
+    router.setRouting({ primary: 'primary', fallback: 'fallback' });
+
+    const results = await router.executeAll<{ value: number }>('company.financials', {});
+    expect(results).toHaveLength(2);
+    expect(results.filter((result) => result.ok).map((result) => result.ok && result.provenance.providerId)).toEqual([
+      'primary',
+      'fallback',
+    ]);
+  });
+
+  it('returns the primary result on success', async () => {
+    const router = new ProviderRouter();
+    let fallbackCalls = 0;
+    router.register(
+      new FakeFinancialDataProvider('primary', 'Primary', ['market.quote'], async () =>
+        success('primary', 'Primary', { value: 'p' })
+      )
+    );
+    router.register(
+      new FakeFinancialDataProvider('fallback', 'Fallback', ['market.quote'], async () => {
+        fallbackCalls += 1;
+        return success('fallback', 'Fallback', { value: 'f' });
+      })
+    );
+    router.setRouting({ primary: 'primary', fallback: 'fallback' });
+
+    const result = await router.execute<{ value: string }>('market.quote', { symbol: 'AAPL.US' });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.data.value).toBe('p');
+      expect(result.provenance.providerId).toBe('primary');
+    }
+    expect(fallbackCalls).toBe(0);
+  });
+
+  it('falls back on primary failure and keeps the fallback provenance (spec §62)', async () => {
+    const router = new ProviderRouter();
+    router.register(
+      new FakeFinancialDataProvider('primary', 'Primary', ['market.quote'], async () =>
+        failure('TIMEOUT', 'primary timed out')
+      )
+    );
+    router.register(
+      new FakeFinancialDataProvider('fallback', 'Fallback', ['market.quote'], async () =>
+        success('fallback', 'Fallback', { value: 'f' })
+      )
+    );
+    router.setRouting({ primary: 'primary', fallback: 'fallback' });
+
+    const result = await router.execute<{ value: string }>('market.quote', {});
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.data.value).toBe('f');
+      expect(result.provenance.providerId).toBe('fallback');
+      expect(result.provenance.providerName).toBe('Fallback');
+    }
+  });
+
+  it('skips an unsupported primary and serves from the fallback', async () => {
+    const router = new ProviderRouter();
+    let primaryCalls = 0;
+    router.register(
+      new FakeFinancialDataProvider('primary', 'Primary', ['market.quote'], async () => {
+        primaryCalls += 1;
+        return success('primary', 'Primary', { value: 'p' });
+      })
+    );
+    router.register(
+      new FakeFinancialDataProvider('fallback', 'Fallback', ['market.depth'], async () =>
+        success('fallback', 'Fallback', { depth: 42 })
+      )
+    );
+    router.setRouting({ primary: 'primary', fallback: 'fallback' });
+
+    const result = await router.execute<{ depth: number }>('market.depth', {});
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.data.depth).toBe(42);
+      expect(result.provenance.providerId).toBe('fallback');
+    }
+    expect(primaryCalls).toBe(0);
+  });
+
+  it('does not fall back when the primary returns ABORTED', async () => {
+    const router = new ProviderRouter();
+    let fallbackCalls = 0;
+    router.register(
+      new FakeFinancialDataProvider('primary', 'Primary', ['market.quote'], async () =>
+        failure('ABORTED', 'aborted')
+      )
+    );
+    router.register(
+      new FakeFinancialDataProvider('fallback', 'Fallback', ['market.quote'], async () => {
+        fallbackCalls += 1;
+        return success('fallback', 'Fallback', { value: 'f' });
+      })
+    );
+    router.setRouting({ primary: 'primary', fallback: 'fallback' });
+
+    const result = await router.execute('market.quote', {});
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('ABORTED');
+    }
+    expect(fallbackCalls).toBe(0);
+  });
+
+  it('returns ABORTED immediately when the signal is already aborted', async () => {
+    const router = new ProviderRouter();
+    let primaryCalls = 0;
+    router.register(
+      new FakeFinancialDataProvider('primary', 'Primary', ['market.quote'], async () => {
+        primaryCalls += 1;
+        return success('primary', 'Primary', { value: 'p' });
+      })
+    );
+    router.setRouting({ primary: 'primary' });
+
+    const controller = new AbortController();
+    controller.abort();
+    const result = await router.execute('market.quote', {}, controller.signal);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('ABORTED');
+    }
+    expect(primaryCalls).toBe(0);
+  });
+
+  it('removes external abort listeners after successful calls on a shared signal', async () => {
+    const router = new ProviderRouter({ timeoutMs: 100 });
+    router.register(
+      new FakeFinancialDataProvider('primary', 'Primary', ['market.quote'], async () =>
+        success('primary', 'Primary', { value: 'p' })
+      )
+    );
+    router.setRouting({ primary: 'primary' });
+
+    const controller = new AbortController();
+    for (let i = 0; i < 12; i += 1) {
+      const result = await router.execute('market.quote', {}, controller.signal);
+      expect(result.ok).toBe(true);
+    }
+
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+  });
+
+  it('removes external abort listeners when a provider fails', async () => {
+    const router = new ProviderRouter({ timeoutMs: 100 });
+    router.register(
+      new FakeFinancialDataProvider('primary', 'Primary', ['market.quote'], async () =>
+        failure('NETWORK_ERROR', 'provider failed')
+      )
+    );
+    router.setRouting({ primary: 'primary' });
+
+    const controller = new AbortController();
+    const result = await router.execute('market.quote', {}, controller.signal);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe('NETWORK_ERROR');
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+  });
+
+  it('removes external abort listeners when a provider times out', async () => {
+    const router = new ProviderRouter({ timeoutMs: 5 });
+    let releaseProvider!: () => void;
+    const providerPending = new Promise<void>((resolve) => {
+      releaseProvider = resolve;
+    });
+    router.register(
+      new FakeFinancialDataProvider('primary', 'Primary', ['market.quote'], async () => {
+        await providerPending;
+        return success('primary', 'Primary', { value: 'late' });
+      })
+    );
+    router.setRouting({ primary: 'primary' });
+
+    const controller = new AbortController();
+    const result = await router.execute('market.quote', {}, controller.signal);
+    releaseProvider();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe('TIMEOUT');
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+  });
+
+  it('removes external abort listeners and skips fallback after an in-flight abort', async () => {
+    const router = new ProviderRouter({ timeoutMs: 100 });
+    const started = Promise.withResolvers<void>();
+    let fallbackCalls = 0;
+    router.register(
+      new FakeFinancialDataProvider('primary', 'Primary', ['market.quote'], async (_cap, _input, signal) => {
+        started.resolve();
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) {
+            resolve();
+            return;
+          }
+          signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+        return failure('ABORTED', 'aborted');
+      })
+    );
+    router.register(
+      new FakeFinancialDataProvider('fallback', 'Fallback', ['market.quote'], async () => {
+        fallbackCalls += 1;
+        return success('fallback', 'Fallback', { value: 'f' });
+      })
+    );
+    router.setRouting({ primary: 'primary', fallback: 'fallback' });
+
+    const controller = new AbortController();
+    const pending = router.execute('market.quote', {}, controller.signal);
+    await started.promise;
+    controller.abort();
+    const result = await pending;
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe('ABORTED');
+    expect(fallbackCalls).toBe(0);
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+  });
+
+  it('returns the last error when all candidates fail', async () => {
+    const router = new ProviderRouter();
+    router.register(
+      new FakeFinancialDataProvider('primary', 'Primary', ['market.quote'], async () =>
+        failure('AUTH_EXPIRED', 'auth gone')
+      )
+    );
+    router.register(
+      new FakeFinancialDataProvider('fallback', 'Fallback', ['market.quote'], async () =>
+        failure('RATE_LIMITED', 'slow down')
+      )
+    );
+    router.setRouting({ primary: 'primary', fallback: 'fallback' });
+
+    const result = await router.execute('market.quote', {});
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('RATE_LIMITED');
+    }
+  });
+
+  it('returns UNSUPPORTED_CAPABILITY when nothing covers the capability', async () => {
+    const router = new ProviderRouter();
+    router.register(new FakeFinancialDataProvider('primary', 'Primary', ['market.quote']));
+    router.setRouting({ primary: 'primary' });
+
+    const result = await router.execute('market.depth', {});
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('UNSUPPORTED_CAPABILITY');
+    }
+  });
+
+  it('dispatches a broker capability straight to a broker fallback', async () => {
+    const router = new ProviderRouter();
+    router.register(new FakeFinancialDataProvider('primary', 'Primary', ['market.quote']));
+    const broker = new FakeBrokerAccountProvider('broker', 'Broker');
+    router.register(broker);
+    router.setRouting({ primary: 'primary', fallback: 'broker' });
+
+    const result = await router.execute<PortfolioSnapshot>('portfolio.summary', {});
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.provenance.providerId).toBe('broker');
+      expect(result.data.fetchedAt).toBe(1000);
+    }
+  });
+
+  it('reaches a registered broker even when it is not in the routing chain', async () => {
+    // The app routes primary=longbridge, fallback=massive — neither serves
+    // portfolio.*. A registered broker must still answer broker capabilities
+    // (this is what makes the agent's get_portfolio work).
+    const router = new ProviderRouter();
+    router.register(new FakeFinancialDataProvider('data', 'Data', ['market.quote']));
+    router.register(new FakeFinancialDataProvider('massive', 'Massive', ['market.quote']));
+    router.register(new FakeBrokerAccountProvider('broker', 'Broker'));
+    router.setRouting({ primary: 'data', fallback: 'massive' });
+
+    const result = await router.execute<PortfolioSnapshot>('portfolio.summary', {});
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.provenance.providerId).toBe('broker');
+    }
+  });
+});
+
+describe('ProviderRouter.coverage + capabilityMapping', () => {
+  it('builds a coverage matrix, including the four broker capabilities', () => {
+    const router = new ProviderRouter();
+    router.register(new FakeFinancialDataProvider('market', 'Market', ['market.quote', 'market.depth']));
+    router.register(new FakeBrokerAccountProvider('broker', 'Broker'));
+
+    const coverage = router.coverage();
+    const market = coverage.find((entry) => entry.providerId === 'market');
+    const broker = coverage.find((entry) => entry.providerId === 'broker');
+
+    expect(market?.capabilities).toEqual(['market.quote', 'market.depth']);
+    expect(market?.markets).toEqual([{ id: 'US', name: 'United States' }]);
+    expect(broker?.capabilities).toEqual([...BROKER_CAPABILITY_IDS]);
+    expect(broker?.markets).toEqual([]);
+  });
+
+  it('maps capabilities to ordered provider chains', () => {
+    const coverage = [
+      { providerId: 'primary', capabilities: ['market.quote', 'portfolio.summary'], markets: [] },
+      { providerId: 'fallback', capabilities: ['market.quote', 'market.depth'], markets: [] },
+    ];
+    const mapping = capabilityMapping({ primary: 'primary', fallback: 'fallback' }, coverage);
+
+    expect(mapping.get('market.quote')).toEqual(['primary', 'fallback']);
+    expect(mapping.get('portfolio.summary')).toEqual(['primary']);
+    expect(mapping.get('market.depth')).toEqual(['fallback']);
+  });
+});
+
+/**
+ * JsonFileStore whose reads yield before completing, widening the
+ * read-modify-write window so that a lost-update regression interleaves
+ * deterministically under Promise.all (issue #145).
+ */
+class SlowReadJsonFileStore extends JsonFileStore {
+  constructor(dir: string, private readonly delayMs: number) {
+    super(dir);
+  }
+
+  override async read<T>(file: string, fallback: T): Promise<T> {
+    await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+    return super.read<T>(file, fallback);
+  }
+}
+
+describe('ConnectionStore', () => {
+  let dir = '';
+  let store: JsonFileStore;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'finagent-connections-'));
+    store = new JsonFileStore(dir);
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('round-trips connection state through the file', async () => {
+    const connections = new ConnectionStore(store);
+    await connections.update({
+      providerId: 'longbridge',
+      status: 'connected',
+      lastCheck: 1000,
+      connectedAt: 900,
+    });
+    await connections.update({
+      providerId: 'broker',
+      status: 'error',
+      lastCheck: 1001,
+      error: { code: 'AUTH_EXPIRED', message: 're-auth needed' },
+    });
+
+    expect(await connections.list()).toHaveLength(2);
+    expect(await connections.get('longbridge')).toMatchObject({ providerId: 'longbridge', status: 'connected' });
+
+    // A fresh store over the same dir reads the persisted file back.
+    const reloaded = new ConnectionStore(new JsonFileStore(dir));
+    const reloadedList = await reloaded.list();
+    expect(reloadedList).toHaveLength(2);
+    expect(reloadedList.find((state) => state.providerId === 'broker')?.error?.code).toBe('AUTH_EXPIRED');
+  });
+
+  it('notifies subscribers on update and supports unsubscribe', async () => {
+    const connections = new ConnectionStore(store);
+    const seen: string[][] = [];
+    const unsubscribe = connections.subscribe((states) => {
+      seen.push(states.map((state) => state.providerId));
+    });
+
+    await connections.update({ providerId: 'a', status: 'connected', lastCheck: 1 });
+    await connections.update({ providerId: 'b', status: 'connecting', lastCheck: 2 });
+    expect(seen).toHaveLength(2);
+
+    unsubscribe();
+    await connections.update({ providerId: 'c', status: 'connected', lastCheck: 3 });
+    expect(seen).toHaveLength(2);
+  });
+
+  it('restores non-secret settings and routing without persisting a credential canary', async () => {
+    const connections = new ConnectionStore(store);
+    await connections.setConfig('massive', {
+      enabled: false,
+      endpoint: 'https://example.test',
+      region: 'US',
+      ...({ apiKey: 'canary-secret-123' } as unknown as Record<string, never>),
+    });
+    await connections.setRouting({ primary: 'massive', fallback: 'longbridge' });
+
+    const reloaded = new ConnectionStore(new JsonFileStore(dir));
+    expect(await reloaded.getConfig('massive')).toEqual({
+      enabled: false,
+      endpoint: 'https://example.test',
+      region: 'US',
+    });
+    expect(await reloaded.getRouting({ primary: 'longbridge' })).toEqual({
+      primary: 'massive',
+      fallback: 'longbridge',
+    });
+    const raw = await store.read<Record<string, unknown>>('connections.json', {});
+    expect(JSON.stringify(raw)).not.toContain('canary-secret-123');
+  });
+
+  it('persists endpoints without cleartext userinfo credentials (issue #93)', async () => {
+    const connections = new ConnectionStore(store);
+    await connections.setConfig('massive', {
+      enabled: true,
+      endpoint: 'https://folio_user:sup3rsecret@db.host.internal:5432/api',
+    });
+
+    // At-rest file must not carry the password.
+    const raw = await store.read<Record<string, unknown>>('connections.json', {});
+    expect(JSON.stringify(raw)).not.toContain('sup3rsecret');
+    expect(JSON.stringify(raw)).not.toContain('folio_user:');
+    // Host/path survive so the target stays readable.
+    expect(JSON.stringify(raw)).toContain('db.host.internal:5432/api');
+    expect(JSON.stringify(raw)).toContain('[REDACTED]');
+
+    // Read side never surfaces the credential either.
+    const config = await connections.getConfig('massive');
+    expect(config?.endpoint).toBe('https://[REDACTED]@db.host.internal:5432/api');
+  });
+
+  it('sanitizes legacy cleartext-userinfo configs on read (issue #93)', async () => {
+    // Simulate a file written before the fix.
+    await store.write('connections.json', {
+      connections: [],
+      configs: {
+        massive: { enabled: true, endpoint: 'https://user:legacy-pass@old.host/api' },
+      },
+    });
+    const connections = new ConnectionStore(store);
+    expect((await connections.getConfig('massive'))?.endpoint).toBe(
+      'https://[REDACTED]@old.host/api'
+    );
+  });
+
+  it('leaves endpoints without userinfo untouched (issue #93)', async () => {
+    const connections = new ConnectionStore(store);
+    await connections.setConfig('massive', {
+      enabled: true,
+      endpoint: 'https://api.example.com/v1?symbol=AAPL',
+    });
+    expect((await connections.getConfig('massive'))?.endpoint).toBe(
+      'https://api.example.com/v1?symbol=AAPL'
+    );
+  });
+
+  it('serializes concurrent setConfig so no provider config is silently dropped (issue #145)', async () => {
+    const connections = new ConnectionStore(new SlowReadJsonFileStore(dir, 20));
+    await Promise.all([
+      connections.setConfig('massive', {
+        enabled: true,
+        endpoint: 'https://a.example',
+        region: 'US',
+      }),
+      connections.setConfig('longbridge', {
+        enabled: false,
+        endpoint: 'https://b.example',
+        region: 'HK',
+      }),
+    ]);
+    const file = await store.read<{
+      connections: unknown[];
+      configs?: Record<string, Record<string, unknown>>;
+    }>('connections.json', { connections: [] });
+    expect(Object.keys(file.configs ?? {}).sort()).toEqual(['longbridge', 'massive']);
+    expect(file.configs?.massive).toMatchObject({ enabled: true, region: 'US' });
+    expect(file.configs?.longbridge).toMatchObject({ enabled: false, region: 'HK' });
+  });
+
+  it('serializes concurrent update and setConfig so both land (issue #145)', async () => {
+    const connections = new ConnectionStore(new SlowReadJsonFileStore(dir, 20));
+    await Promise.all([
+      connections.setConfig('massive', { enabled: true }),
+      connections.update({ providerId: 'massive', status: 'connected', lastCheck: 1 }),
+    ]);
+    const file = await store.read<{
+      connections: { providerId: string }[];
+      configs?: Record<string, Record<string, unknown>>;
+    }>('connections.json', { connections: [] });
+    expect(file.connections).toHaveLength(1);
+    expect(file.connections[0]?.providerId).toBe('massive');
+    expect(file.configs?.massive).toMatchObject({ enabled: true });
+  });
+
+  it('serializes concurrent setRouting and setConfig so both land (issue #145)', async () => {
+    const connections = new ConnectionStore(new SlowReadJsonFileStore(dir, 20));
+    await Promise.all([
+      connections.setConfig('massive', { enabled: true }),
+      connections.setRouting({ primary: 'massive', fallback: 'longbridge' }),
+    ]);
+    const file = await store.read<{
+      connections: unknown[];
+      configs?: Record<string, Record<string, unknown>>;
+      routing?: Record<string, string>;
+    }>('connections.json', { connections: [] });
+    expect(file.configs?.massive).toMatchObject({ enabled: true });
+    expect(file.routing).toMatchObject({ primary: 'massive', fallback: 'longbridge' });
+  });
+});
+
+describe('createRouterFetchers', () => {
+  it('returns data on success', async () => {
+    const router = new ProviderRouter();
+    const quote = {
+      symbol: 'AAPL.US',
+      lastPrice: 224.12,
+      change: 0,
+      changePercent: 0,
+      volume: 0,
+      timestamp: 1000,
+      high: 0,
+      low: 0,
+      open: 0,
+      prevClose: 0,
+    };
+    router.register(
+      new FakeFinancialDataProvider('primary', 'Primary', ['market.quote'], async () =>
+        success('primary', 'Primary', quote)
+      )
+    );
+    router.setRouting({ primary: 'primary' });
+
+    const fetchers = createRouterFetchers(router);
+    const result = await fetchers.getQuote('AAPL.US');
+    expect(result).toEqual(quote);
+  });
+
+  it('throws a normalized ProviderFetchError on failure', async () => {
+    const router = new ProviderRouter();
+    router.register(
+      new FakeFinancialDataProvider('primary', 'Primary', ['market.quote'], async () =>
+        failure('RATE_LIMITED', 'slow down')
+      )
+    );
+    router.setRouting({ primary: 'primary' });
+
+    const fetchers = createRouterFetchers(router);
+    let caught: unknown;
+    try {
+      await fetchers.getQuote('AAPL.US');
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ProviderFetchError);
+    if (caught instanceof ProviderFetchError) {
+      expect(caught.code).toBe('RATE_LIMITED');
+      expect(caught.message).toBe('slow down');
+    }
+  });
+});
+
+describe('healthAll', () => {
+  it('returns per-provider snapshots', async () => {
+    const providers = [
+      new FakeFinancialDataProvider('a', 'A', ['market.quote']),
+      new FakeBrokerAccountProvider('b', 'B'),
+    ];
+    const snapshots = await healthAll(providers);
+    expect(snapshots).toHaveLength(2);
+    expect(snapshots.map((snapshot) => snapshot.status)).toEqual(['connected', 'connected']);
+  });
+
+  it('degrades a throwing status() to an error snapshot', async () => {
+    const broken = new FakeFinancialDataProvider('broken', 'Broken', [], async () =>
+      success('broken', 'Broken', undefined)
+    );
+    const originalStatus = broken.status.bind(broken);
+    broken.status = async () => {
+      await originalStatus();
+      throw new Error('boom');
+    };
+    const snapshots = await healthAll([broken]);
+    expect(snapshots[0].status).toBe('error');
+  });
+});

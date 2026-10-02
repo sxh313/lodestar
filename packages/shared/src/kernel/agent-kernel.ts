@@ -1,0 +1,142 @@
+import { join } from 'node:path';
+import type { AgentRuntime, ApiResult, ToolDefinition } from '@finagent/core';
+import type { SkillHub } from '@finagent/skill-hub';
+import { JsonFileStore } from '../storage/json-file-store.ts';
+import { MessageRepository } from '../storage/message-repository.ts';
+import { RunRepository } from '../storage/run-repository.ts';
+import { SessionRepository } from '../storage/session-repository.ts';
+import { LocalRuntimeAdapter } from '../agent/local-runtime-adapter.ts';
+import { PiRuntimeAdapter, type LlmRuntimeApi } from '../agent/pi-runtime-adapter.ts';
+import { FinanceToolRegistry } from '../agent/finance-tool-registry.ts';
+import { MarketDataService } from '../agent/market-data-service.ts';
+import { createCodeError } from '../agent/errors.ts';
+import type { PiRpcClientOptions } from '../agent/pi-rpc-client.ts';
+import { SessionManager } from './session-manager.ts';
+import { RunManager } from './run-manager.ts';
+import type { ResolveBudgetInput } from './run-budget.ts';
+import type { RunawayPolicy } from './runaway-detector.ts';
+
+export type AgentProvider = 'local' | 'pi-runtime';
+
+export interface AgentKernelOptions {
+  /** Directory for Lodestar session/message/run persistence. */
+  storageDir: string;
+  /** Directory for per-session runtime conversation files (Pi JSONL). */
+  piSessionDir: string;
+  provider?: AgentProvider;
+  /** Explicit runtime override (tests). */
+  runtime?: AgentRuntime;
+  marketData?: MarketDataService;
+  /** Label local-runtime answer blocks as built-in sample data (#31 demo mode). */
+  demoData?: boolean;
+  /**
+   * Capability-backed tool registry shared by the local and Pi adapters.
+   * Defaults to the phase-1 registry when omitted.
+   */
+  registry?: FinanceToolRegistry;
+  rpc?: PiRpcClientOptions;
+  /** Skill hub used for progressive skill loading in the runtime prompt. */
+  skillHub?: SkillHub;
+  now?: () => number;
+  /**
+   * Budget defaults and the system ceiling every run obeys (#17). Without it
+   * runs are unbudgeted; a run may still tighten its own limits at startRun.
+   */
+  budgets?: ResolveBudgetInput;
+  /** Tool-name patterns (`*` wildcard) whose `query` argument feeds the search-loop detector. */
+  searchTools?: string[];
+  /** Runaway detector thresholds; unset fields fall back to `defaultRunawayPolicy()`. */
+  runaway?: Partial<RunawayPolicy>;
+}
+
+/**
+ * Composition root of the V1 agent kernel:
+ *
+ *   SessionManager (persistence + lifecycle)
+ *     → RunManager (run lifecycle + event broadcast)
+ *       → AgentRuntime (Pi or local adapter)
+ *         → Pi runtime / event stream
+ */
+export class AgentKernel {
+  readonly sessions: SessionManager;
+  readonly runs: RunManager;
+  readonly runtime: AgentRuntime;
+  readonly marketData: MarketDataService;
+
+  constructor(options: AgentKernelOptions) {
+    const now = options.now ?? Date.now;
+    const store = new JsonFileStore(options.storageDir);
+    this.marketData = options.marketData ?? new MarketDataService();
+    this.sessions = new SessionManager({
+      sessions: new SessionRepository(store),
+      messages: new MessageRepository(store),
+      runs: new RunRepository(store),
+      piSessionDir: options.piSessionDir,
+      now,
+    });
+
+    this.runtime = options.runtime ?? createDefaultRuntime(options, this.marketData, now);
+
+    this.runs = new RunManager({
+      sessions: this.sessions,
+      runs: new RunRepository(store),
+      runtime: this.runtime,
+      now,
+      budgets: options.budgets,
+      searchTools: options.searchTools,
+      runaway: options.runaway,
+      // issue #75：与 kernel 存储同目录落盘流事件日志，支持跨重启 replay。
+      streamLogDir: join(options.storageDir, 'stream-events'),
+    });
+  }
+
+  getTools(): Promise<ApiResult<ToolDefinition[]>> {
+    return this.runtime.getTools();
+  }
+
+  /** LLM control surface when the runtime is the Pi adapter; undefined in local mode. */
+  getLlmApi(): LlmRuntimeApi | undefined {
+    if (this.runtime instanceof PiRuntimeAdapter) {
+      return this.runtime.getLlmApi();
+    }
+    return undefined;
+  }
+
+  /**
+   * Delete a session and its persisted data, then dispose the corresponding
+   * runtime session (e.g. remove the Pi conversation file). Rejects while a
+   * run is active in the session so a run never lands in a deleted session.
+   */
+  async deleteSession(sessionId: string): Promise<void> {
+    if (this.runs.hasActiveRun(sessionId)) {
+      throw createCodeError(
+        'RUN_IN_PROGRESS',
+        'A run is active in this session. Stop it before deleting the session.'
+      );
+    }
+    await this.sessions.deleteSession(sessionId);
+    await this.runtime.disposeSession?.(sessionId);
+  }
+
+  async dispose(): Promise<void> {
+    await this.runtime.dispose();
+  }
+}
+
+function createDefaultRuntime(
+  options: AgentKernelOptions,
+  marketData: MarketDataService,
+  now: () => number
+): AgentRuntime {
+  if (options.provider === 'local') {
+    return new LocalRuntimeAdapter({ marketData, registry: options.registry, demoData: options.demoData, now });
+  }
+  return new PiRuntimeAdapter({
+    marketData,
+    registry: options.registry,
+    sessionDir: options.piSessionDir,
+    rpc: options.rpc,
+    skillHub: options.skillHub,
+    now,
+  });
+}

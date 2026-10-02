@@ -1,0 +1,438 @@
+import React, { useCallback, useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import type { FinancialProviderStatus } from '@finagent/core';
+import { useFinagentClient } from '../../client';
+import {
+  connectProvider,
+  connectionStatusLabel,
+  disconnectProvider,
+  hasOpenExternal,
+  openExternalUrl,
+  quoteAccessSummary,
+  setProviderConfig,
+  testProvider,
+  type ConnectionEntry,
+  type ConnectionKind,
+} from '../../client/connections';
+import { Button } from '../primitives/Button';
+import { Input } from '../primitives/Input';
+
+/** Official Longbridge setup docs (never curl|sh from the renderer). */
+const LONGBRIDGE_SETUP_URL = 'https://open.longbridge.com/skill/install.md';
+
+const KIND_LABEL_KEY: Record<ConnectionKind, string> = {
+  'financial-data': 'connections.kindFinancialData',
+  'broker-account': 'connections.kindBrokerAccount',
+};
+
+const STATUS_DOT: Record<FinancialProviderStatus, string> = {
+  'not-installed': 'bg-foreground/30',
+  'not-connected': 'bg-foreground/40',
+  connecting: 'bg-info animate-pulse',
+  connected: 'bg-success',
+  'permission-limited': 'bg-info',
+  expired: 'bg-info',
+  error: 'bg-destructive',
+};
+
+type BusyAction = 'connect' | 'disconnect' | 'test' | 'setConfig' | 'settings';
+
+/** A single provider connection card: status, actions, and the device/BYOK flows. */
+export const ConnectionCard: React.FC<{
+  entry: ConnectionEntry;
+  onChanged: () => void;
+}> = ({ entry, onChanged }) => {
+  const { t } = useTranslation();
+  const client = useFinagentClient();
+  const [busy, setBusy] = useState<BusyAction | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // Device-flow state (longbridge).
+  const [verificationUrl, setVerificationUrl] = useState<string | null>(null);
+
+  // BYOK state (massive).
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [apiKey, setApiKey] = useState('');
+  const [endpoint, setEndpoint] = useState(entry.endpoint ?? '');
+  const [region, setRegion] = useState(entry.region ?? '');
+
+  const [testSummary, setTestSummary] = useState<string | null>(null);
+
+  const waiting = verificationUrl !== null || entry.status === 'connecting';
+
+  // When the pushed list reports a terminal status, drop the local device state.
+  useEffect(() => {
+    if (entry.status !== 'connecting') {
+      setVerificationUrl(null);
+    }
+  }, [entry.status]);
+
+  const clearError = useCallback(() => setError(null), []);
+
+  const run = useCallback(
+    async (action: BusyAction, task: () => Promise<{ ok: boolean; error: string | null }>) => {
+      setBusy(action);
+      setError(null);
+      const result = await task();
+      setBusy(null);
+      if (!result.ok && result.error) {
+        setError(result.error);
+      }
+    },
+    []
+  );
+
+  const handleDeviceConnect = useCallback(async () => {
+    setBusy('connect');
+    setError(null);
+    const result = await connectProvider(client, entry.providerId);
+    setBusy(null);
+    if (result.ok && result.data) {
+      if (result.data.status === 'connecting') {
+        setVerificationUrl(result.data.verificationUrl ?? null);
+      }
+      onChanged();
+    } else {
+      setError(result.error?.message ?? t('connections.connectionFailed'));
+    }
+  }, [client, entry.providerId, onChanged, t]);
+
+  const handleConnect = useCallback(() => {
+    if (entry.configurable) {
+      setShowApiKey(true);
+      setError(null);
+      return;
+    }
+    void handleDeviceConnect();
+  }, [entry.configurable, handleDeviceConnect]);
+
+  const handleSaveKey = useCallback(async () => {
+    const key = apiKey.trim();
+    if (!key && !entry.configured) {
+      setError(t('connections.enterApiKeyError'));
+      return;
+    }
+    await run('setConfig', async () => {
+      const result = await setProviderConfig(client, entry.providerId, {
+        apiKey: key || undefined,
+        endpoint,
+        region,
+      });
+      if (result.ok) {
+        setApiKey('');
+        setShowApiKey(false);
+        setTestSummary(null);
+        onChanged();
+        return { ok: true, error: null };
+      }
+      return { ok: false, error: result.error?.message ?? t('connections.saveApiKeyFailed') };
+    });
+  }, [apiKey, client, endpoint, entry.configured, entry.providerId, onChanged, region, run, t]);
+
+  const updateSetting = useCallback(async (config: { enabled?: boolean; routingRole?: 'primary' | 'fallback' }) => {
+    await run('settings', async () => {
+      const result = await setProviderConfig(client, entry.providerId, config);
+      if (result.ok) {
+        onChanged();
+        return { ok: true, error: null };
+      }
+      return { ok: false, error: result.error?.message ?? t('connections.saveSettingsFailed') };
+    });
+  }, [client, entry.providerId, onChanged, run, t]);
+
+  const handleDisconnect = useCallback(() => {
+    void run('disconnect', async () => {
+      const result = await disconnectProvider(client, entry.providerId);
+      if (result.ok) {
+        onChanged();
+        return { ok: true, error: null };
+      }
+      return { ok: false, error: result.error?.message ?? t('connections.disconnectFailed') };
+    });
+  }, [client, entry.providerId, onChanged, run, t]);
+
+  const handleTest = useCallback(() => {
+    void run('test', async () => {
+      const result = await testProvider(client, entry.providerId);
+      if (result.ok && result.data) {
+        const health = result.data;
+        const latency = health.latencyMs != null ? ` · ${health.latencyMs}ms` : '';
+        setTestSummary(`${connectionStatusLabel(health.status)}${latency}`);
+        return { ok: true, error: null };
+      }
+      return { ok: false, error: result.error?.message ?? t('connections.testFailed') };
+    });
+  }, [client, entry.providerId, run, t]);
+
+  const handleCancel = useCallback(() => {
+    setVerificationUrl(null);
+    setError(null);
+    onChanged();
+  }, [onChanged]);
+
+  const handleInstall = useCallback(() => {
+    void openExternalUrl(client, LONGBRIDGE_SETUP_URL);
+  }, [client]);
+
+  const status = entry.status;
+  const accountLabel = entry.accountLabel ?? entry.health?.account ?? null;
+  const quoteAccess = quoteAccessSummary(entry.health?.permissions);
+  const portfolioReady = entry.kind === 'broker-account' && status === 'connected';
+  const lastCheck = entry.health?.lastCheck;
+
+  const byok = entry.configurable;
+
+  const renderPrimaryAction = () => {
+    if (waiting) {
+      return (
+        <Button variant="outline" size="sm" onClick={handleCancel} disabled={busy !== null}>
+          {t('common.cancel')}
+        </Button>
+      );
+    }
+    if (status === 'not-installed') {
+      return (
+        <Button variant="outline" size="sm" onClick={handleInstall}>
+          {t('connections.installSetup')}
+        </Button>
+      );
+    }
+    if (status === 'not-connected') {
+      return (
+        <Button size="sm" onClick={handleConnect} disabled={busy !== null} data-testid={`connect-${entry.providerId}`}>
+          {busy === 'connect' ? t('connections.connecting') : t('connections.connect')}
+        </Button>
+      );
+    }
+    if (status === 'connected') {
+      return (
+        <>
+          {byok && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => setShowApiKey(true)}
+              disabled={busy !== null}
+            >
+              {t('connections.configure')}
+            </Button>
+          )}
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={handleTest}
+            disabled={busy !== null}
+            data-testid={`test-${entry.providerId}`}
+          >
+            {busy === 'test' ? t('connections.testing') : t('connections.testConnection')}
+          </Button>
+          <Button size="sm" variant="ghost" onClick={handleDisconnect} disabled={busy !== null}>
+            {busy === 'disconnect' ? t('connections.disconnecting') : t('connections.disconnect')}
+          </Button>
+        </>
+      );
+    }
+    // permission-limited | expired | error → reconnect + test + disconnect
+    return (
+      <>
+        <Button size="sm" onClick={handleConnect} disabled={busy !== null}>
+          {busy === 'connect' ? t('connections.connecting') : t('connections.reconnect')}
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={handleTest}
+          disabled={busy !== null}
+          data-testid={`test-${entry.providerId}`}
+        >
+          {busy === 'test' ? t('connections.testing') : t('connections.testConnection')}
+        </Button>
+        <Button size="sm" variant="ghost" onClick={handleDisconnect} disabled={busy !== null}>
+          {t('connections.disconnect')}
+        </Button>
+      </>
+    );
+  };
+
+  return (
+    <div
+      className="rounded-xl border border-border bg-surface p-5 shadow-sm"
+      data-testid={`connection-card-${entry.providerId}`}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <h3 className="truncate text-[14px] font-semibold text-foreground">{entry.name}</h3>
+            <span className="shrink-0 rounded-full border border-border bg-surface-muted px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-foreground/54">
+              {t(KIND_LABEL_KEY[entry.kind])}
+            </span>
+          </div>
+          <div className="mt-1.5 flex items-center gap-1.5">
+            <span
+              className={`h-2 w-2 rounded-full ${STATUS_DOT[status]}`}
+              aria-hidden="true"
+              data-testid={`status-dot-${entry.providerId}`}
+            />
+            <span className="rounded-full bg-surface-muted px-2 py-0.5 text-[11px] text-foreground/66" data-testid={`status-${entry.providerId}`}>
+              {connectionStatusLabel(status)}
+            </span>
+          </div>
+        </div>
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+          {renderPrimaryAction()}
+        </div>
+      </div>
+
+      <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-border pt-3 text-[11px] text-foreground/60">
+        <label className="flex items-center gap-1.5">
+          <input
+            type="checkbox"
+            checked={entry.enabled !== false}
+            disabled={busy !== null}
+            data-testid={`enabled-${entry.providerId}`}
+            onChange={(event) => void updateSetting({ enabled: event.target.checked })}
+          />
+          {t('connections.enabled')}
+        </label>
+        <button
+          type="button"
+          className={entry.routingRole === 'primary' ? 'text-accent' : 'hover:text-foreground'}
+          disabled={busy !== null}
+          data-testid={`primary-${entry.providerId}`}
+          onClick={() => void updateSetting({ routingRole: 'primary' })}
+        >
+          {t('connections.useAsPrimary')}
+        </button>
+        <button
+          type="button"
+          className={entry.routingRole === 'fallback' ? 'text-accent' : 'hover:text-foreground'}
+          disabled={busy !== null}
+          data-testid={`fallback-${entry.providerId}`}
+          onClick={() => void updateSetting({ routingRole: 'fallback' })}
+        >
+          {t('connections.useAsFallback')}
+        </button>
+      </div>
+
+      {(accountLabel || quoteAccess || portfolioReady || lastCheck != null) && (
+        <div className="mt-4 flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-border pt-3 text-[11px] text-foreground/54">
+          {accountLabel && <span>{accountLabel}</span>}
+          {quoteAccess && <span>{quoteAccess}</span>}
+          {portfolioReady && <span className="text-success">{t('connections.portfolioReady')}</span>}
+          {lastCheck != null && (
+            <span className="tabular-nums">{new Date(lastCheck).toLocaleString()}</span>
+          )}
+        </div>
+      )}
+
+      {entry.recentResult && (
+        <div className="mt-2 text-[10px] text-foreground/48">
+          {t('connections.recentRuntime')}: {entry.recentResult.capabilityId} ·{' '}
+          {entry.recentResult.ok ? t('connections.runtimeSucceeded') : entry.recentResult.errorCode}
+          {entry.recentResult.fallbackUsed ? ` · ${t('connections.fallbackUsed')}` : ''}
+        </div>
+      )}
+
+      {waiting && (
+        <div className="mt-4 rounded-lg border border-info/30 bg-info/10 p-3">
+          <div className="text-[12px] font-medium text-foreground">{t('connections.waitingAuthorization')}</div>
+          {verificationUrl && (
+            <ExternalLink url={verificationUrl} label={t('connections.openVerificationPage')} clientHasOpenExternal={hasOpenExternal(client)} onOpen={() => void openExternalUrl(client, verificationUrl)} />
+          )}
+          <div className="mt-1.5 text-[11px] text-foreground/48">
+            {t('connections.authorizeHint')}
+          </div>
+        </div>
+      )}
+
+      {byok && showApiKey && (
+        <div className="mt-4 space-y-2 rounded-lg border border-border bg-background/50 p-3">
+          <div className="text-[12px] font-medium text-foreground">{t('connections.enterApiKey')}</div>
+          <Input
+            type="password"
+            value={apiKey}
+            onChange={(event) => setApiKey(event.target.value)}
+            placeholder={t('connections.apiKey')}
+            autoComplete="off"
+          />
+          <Input
+            value={endpoint}
+            onChange={(event) => setEndpoint(event.target.value)}
+            placeholder={t('connections.endpointOptional')}
+            autoComplete="off"
+          />
+          <Input
+            value={region}
+            onChange={(event) => setRegion(event.target.value)}
+            placeholder={t('connections.regionOptional')}
+            autoComplete="off"
+          />
+          <div className="flex items-center gap-2">
+            <Button size="sm" onClick={() => void handleSaveKey()} disabled={busy !== null}>
+              {busy === 'setConfig' ? t('connections.saving') : t('common.save')}
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => setShowApiKey(false)} disabled={busy !== null}>
+              {t('common.cancel')}
+            </Button>
+          </div>
+          {byok && (
+            <div className="text-[10px] leading-relaxed text-foreground/42">
+              {t('connections.byokNote')}
+            </div>
+          )}
+        </div>
+      )}
+
+      {testSummary && !error && (
+        <div className="mt-3 text-[11px] text-success">✓ {testSummary}</div>
+      )}
+
+      {error && (
+        <div
+          className="mt-4 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2.5 text-[12px] text-destructive"
+          role="alert"
+          data-testid={`connection-error-${entry.providerId}`}
+        >
+          {error}
+          <button
+            type="button"
+            className="ml-2 underline underline-offset-2"
+            onClick={clearError}
+            aria-label={t('connections.dismissError')}
+          >
+            {t('connections.dismiss')}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const ExternalLink: React.FC<{
+  url: string;
+  label: string;
+  clientHasOpenExternal: boolean;
+  onOpen: () => void;
+}> = ({ url, label, clientHasOpenExternal, onOpen }) => {
+  if (clientHasOpenExternal) {
+    return (
+      <button
+        type="button"
+        className="text-[12px] font-medium text-accent underline underline-offset-2"
+        onClick={onOpen}
+      >
+        {label}
+      </button>
+    );
+  }
+  return (
+    <a
+      href={url}
+      target="_blank"
+      rel="noreferrer noopener"
+      className="text-[12px] font-medium text-accent underline underline-offset-2"
+    >
+      {label}
+    </a>
+  );
+};

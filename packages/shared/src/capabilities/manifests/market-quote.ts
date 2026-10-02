@@ -1,0 +1,80 @@
+import { Type } from '@sinclair/typebox';
+import {
+  DEFAULT_INSTRUMENT_CATALOG,
+  InstrumentResolver,
+  readInstrumentId,
+} from '@finagent/core';
+import type {
+  FinanceCapability,
+  Quote,
+} from '@finagent/core';
+import { defineCapability } from '../define.ts';
+import { normalizeSymbol } from '../validate.ts';
+import type { CapabilityFetchers } from '../fetchers.ts';
+import { defaultCapabilityFetchers } from '../fetchers.ts';
+
+const DEFAULT_INSTRUMENT_RESOLVER = new InstrumentResolver(DEFAULT_INSTRUMENT_CATALOG);
+
+export function createMarketQuoteCapability(
+  fetchers: CapabilityFetchers = defaultCapabilityFetchers
+): FinanceCapability<{ symbol: string }, Quote> {
+  return defineCapability<{ symbol: string }, Quote>({
+    id: 'market.quote',
+    name: 'Quote',
+    toolName: 'get_quote',
+    category: 'market',
+    riskLevel: 'read',
+    auth: 'public',
+    description:
+      'Get a real-time quote for a single symbol: last price, change, volume, and the day high/low/open/prev-close. Use this whenever the user asks for the current price or the day move of a specific stock.',
+    inputSchema: Type.Object({
+      symbol: Type.String({
+        description: 'Stock symbol, e.g. AAPL.US, 0700.HK, 600519.SH',
+        examples: ['AAPL.US', '0700.HK'],
+      }),
+    }),
+    async execute(input, ctx, reportProvider) {
+      const symbol = normalizeSymbol(input.symbol);
+      const fetched = fetchers.getQuoteResult
+        ? await fetchers.getQuoteResult(symbol, ctx?.signal)
+        : undefined;
+      const quote = fetched?.data ?? await fetchers.getQuote(symbol);
+      if (fetched) reportProvider?.(fetched.provenance);
+      const instrumentId = readInstrumentId(quote) ?? resolveCanonicalInstrumentId(symbol);
+      return {
+        data: quote,
+        provenance: {
+          provider: 'longbridge',
+          providerName: 'Longbridge',
+          ...(instrumentId ? { instrumentId } : {}),
+          fetchedAt: (ctx?.now ?? Date.now)(),
+          marketTime: quote.timestamp * 1000,
+          stale: false,
+        },
+        summary: formatQuote(quote),
+      };
+    },
+  });
+}
+
+function resolveCanonicalInstrumentId(symbol: string): string | undefined {
+  const resolution = DEFAULT_INSTRUMENT_RESOLVER.resolve(symbol, { providerId: 'longbridge' });
+  return resolution.status === 'resolved' ? resolution.instrument.instrumentId : undefined;
+}
+
+function formatQuote(quote: Quote) {
+  const changeIcon = quote.change >= 0 ? '[up]' : '[down]';
+  const changeStr = quote.change >= 0
+    ? `+${quote.change.toFixed(2)} (+${quote.changePercent.toFixed(2)}%)`
+    : `${quote.change.toFixed(2)} (${quote.changePercent.toFixed(2)}%)`;
+  const asOf = new Date(quote.timestamp * 1000).toLocaleString();
+
+  return [
+    `${changeIcon} ${quote.symbol}: $${quote.lastPrice.toFixed(2)}`,
+    `Change: ${changeStr}`,
+    `Volume: ${quote.volume.toLocaleString()}`,
+    `High: $${quote.high.toFixed(2)} | Low: $${quote.low.toFixed(2)}`,
+    `Open: $${quote.open.toFixed(2)} | Prev Close: $${quote.prevClose.toFixed(2)}`,
+    `As of: ${asOf}`,
+  ].join('\n');
+}

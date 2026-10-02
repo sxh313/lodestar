@@ -1,0 +1,213 @@
+// Pi Agent tool interface (local definition since @pi-agent/sdk is not on npm)
+// Using looser types for flexibility
+interface Tool {
+  name: string;
+  label: string;
+  description: string;
+  parameters: unknown;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  execute: (
+    toolCallId: string,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    params: any,
+    signal: AbortSignal
+  ) => Promise<{ content: Array<{ type: string; text: string }> }>;
+}
+
+interface ProviderModelConfig {
+  id: string;
+  name?: string;
+  baseUrl?: string;
+  api?: string;
+  reasoning?: boolean;
+  contextWindow?: number;
+  maxTokens?: number;
+}
+
+interface ProviderConfig {
+  baseUrl?: string;
+  apiKey?: string;
+  api?: string;
+  models?: ProviderModelConfig[];
+}
+
+interface AgentApi {
+  registerTool: (tool: Tool) => void;
+  registerProvider?: (name: string, config: ProviderConfig) => void;
+  on?: (event: string, handler: (event: { prompt?: string }) => unknown) => void;
+  getActiveTools?: () => string[];
+  setActiveTools?: (tools: string[]) => void;
+}
+
+import { createCapabilityTools as buildCapabilityTools, fullCapabilities } from '@finagent/shared/capabilities';
+import { isPortfolioToolName } from '@finagent/shared';
+import type { PrivacyLevel } from '@finagent/core';
+import { listSkillResourcesTool, readSkillResourceTool } from './tools/skillResources.ts';
+
+/** Privacy level for Pi tool output, fixed once at module load (spec §60). */
+const PI_PRIVACY_LEVEL = readPrivacyLevelEnv(process.env);
+
+/**
+ * Read the Finagent tool-output privacy level from an env object
+ * (FINAGENT_PRIVACY_LEVEL=minimal|standard|full). Unknown, empty, or unset
+ * values mean no privacy wrapping — tools keep their raw DATA blocks.
+ */
+export function readPrivacyLevelEnv(
+  env: Record<string, string | undefined>
+): 'minimal' | 'standard' | 'full' | undefined {
+  const raw = env.FINAGENT_PRIVACY_LEVEL;
+  if (!raw) return undefined;
+  const level = raw.trim().toLowerCase();
+  if (level === 'minimal' || level === 'standard' || level === 'full') return level;
+  return undefined;
+}
+
+/**
+ * Wrap tools so portfolio DATA blocks never reach the model below `full`
+ * (spec §60). The original execute runs untouched (same params + signal, so
+ * aborts propagate); only its returned text is rewritten — summary kept, the
+ * raw DATA section replaced by a privacy notice.
+ */
+export function wrapToolsWithPrivacy(
+  tools: readonly Tool[],
+  level: 'minimal' | 'standard' | 'full' | undefined
+): Tool[] {
+  if (level === undefined || level === 'full') return [...tools];
+  // Portfolio tools carry account data (holdings, positions, cash, account
+  // ids): capability ids (portfolio.summary), agent-facing names
+  // (get_portfolio, get_positions, get_assets, get_cash_flow) and legacy ids.
+  return tools.map((tool) =>
+    isPortfolioToolName(tool.name)
+      ? { ...tool, execute: wrapPortfolioExecute(tool.execute, level) }
+      : tool
+  );
+}
+
+const DATA_MARKER = '\n\nDATA: ';
+
+function wrapPortfolioExecute(
+  execute: Tool['execute'],
+  level: 'minimal' | 'standard'
+): Tool['execute'] {
+  return async (toolCallId, params, signal) => {
+    const result = await execute(toolCallId, params, signal);
+    return {
+      content: result.content.map((block) => {
+        if (block.type !== 'text') return block;
+        const marker = block.text.indexOf(DATA_MARKER);
+        // Keep only the summary; drop everything after the DATA marker (or the
+        // whole payload if the marker is missing) — never leak raw values.
+        const summary = marker >= 0 ? block.text.slice(0, marker) : '';
+        return {
+          ...block,
+          text: `${summary}\n\n[Finagent privacy level ${level}: portfolio details redacted]`,
+        };
+      }),
+    };
+  };
+}
+
+/**
+ * Finance tools generated from the shared capability registry manifests.
+ *
+ * The privacy level is read from `env` (default: the process env) so tests
+ * can exercise each level without re-importing the module; the default path
+ * keeps the module-load const semantics used by {@link registerTools}.
+ */
+export function createCapabilityTools(env: NodeJS.ProcessEnv = process.env): Tool[] {
+  return wrapToolsWithPrivacy(buildCapabilityTools(fullCapabilities), readPrivacyLevelEnv(env));
+}
+
+// Tool registry
+export const tools: Tool[] = [
+  ...createCapabilityTools(),
+  listSkillResourcesTool,
+  readSkillResourceTool,
+];
+
+// Export the two hand-written skill-resource tools.
+export { listSkillResourcesTool, readSkillResourceTool };
+
+// Register all tools with Pi Agent
+export function registerTools(agent: AgentApi) {
+  registerResearchSynthesisGuard(agent);
+  for (const tool of tools) {
+    agent.registerTool(tool);
+  }
+}
+
+/** Synthesis replays only checkpointed facts; no tool, including built-ins, may run. */
+export function registerResearchSynthesisGuard(agent: AgentApi): void {
+  let synthesis = false;
+  let previousTools: string[] | undefined;
+  agent.on?.('before_agent_start', (event) => {
+    if (previousTools) agent.setActiveTools?.(previousTools);
+    previousTools = undefined;
+    synthesis = event.prompt?.includes('User request: [FOLIO_CHECKPOINT_SYNTHESIS_V1]') === true;
+    if (synthesis) {
+      previousTools = agent.getActiveTools?.();
+      agent.setActiveTools?.([]);
+    }
+  });
+  agent.on?.('tool_call', () => synthesis
+    ? { block: true, reason: 'Research synthesis must use the saved evidence only; tool calls are disabled.' }
+    : undefined);
+  agent.on?.('agent_end', () => {
+    if (previousTools) agent.setActiveTools?.(previousTools);
+    previousTools = undefined;
+    synthesis = false;
+  });
+}
+
+interface ProviderOverride {
+  provider: string;
+  baseUrl?: string;
+  apiKey?: string;
+  api?: string;
+  models?: ProviderModelConfig[];
+}
+
+/** Parse Lodestar-owned provider overrides from FINAGENT_PROVIDER_OVERRIDES. */
+function readProviderOverrides(): ProviderOverride[] {
+  const raw = process.env.FINAGENT_PROVIDER_OVERRIDES;
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (entry): entry is ProviderOverride =>
+        Boolean(entry) && typeof entry === 'object' && typeof entry.provider === 'string'
+    );
+  } catch {
+    return [];
+  }
+}
+
+export function registerProviderOverrides(agent: AgentApi) {
+  if (typeof agent.registerProvider !== 'function') return;
+
+  // The Anthropic base-URL override is opt-in: apply it only when the user
+  // configures ANTHROPIC_BASE_URL (or an explicit anthropic override below).
+  // With nothing configured the provider's own standard endpoint is used,
+  // rather than silently pointing every install at a vendor relay.
+  const overrides = readProviderOverrides();
+  const hasAnthropicOverride = overrides.some((entry) => entry.provider === 'anthropic');
+  if (!hasAnthropicOverride && process.env.ANTHROPIC_BASE_URL) {
+    agent.registerProvider('anthropic', {
+      baseUrl: process.env.ANTHROPIC_BASE_URL,
+    });
+  }
+
+  for (const entry of overrides) {
+    const config: ProviderConfig = {};
+    if (entry.baseUrl !== undefined) config.baseUrl = entry.baseUrl;
+    if (entry.apiKey !== undefined) config.apiKey = entry.apiKey;
+    if (entry.api !== undefined) config.api = entry.api;
+    if (entry.models !== undefined) config.models = entry.models;
+    agent.registerProvider(entry.provider, config);
+  }
+}
+
+// Type exports
+export type { Quote, Portfolio, Kline, IntradayData } from '@finagent/core';
+export type { Tool };
